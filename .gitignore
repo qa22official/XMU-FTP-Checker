@@ -2,3 +2,4 @@
 build/
 output.txt
 *.zip
+checker_config.json
