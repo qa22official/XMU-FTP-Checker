@@ -3,8 +3,7 @@
     "host": "your.ftp.server",
     "port": 21,
     "username": "your_username",
-    "password": "your_password",
-    "base_path": ""
+    "password": "your_password"
   },
   "key": "要匹配的关键字",
   "paths": [

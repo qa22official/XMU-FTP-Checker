@@ -17,7 +17,6 @@ class FtpConfig:
     port: int
     username: str
     password: str
-    base_path: str
 
 
 @dataclass
@@ -35,20 +34,6 @@ def _normalize_list_path(item: str) -> str:
     if target.startswith("/"):
         target = target[1:]
     return target.strip("/")
-
-
-def safe_join_remote_path(base: str, extra: str | None) -> str:
-    if not extra:
-        return base
-
-    if extra.startswith("/"):
-        return extra
-
-    left = base.rstrip("/")
-    right = extra.lstrip("/")
-    if not left:
-        return f"/{right}"
-    return f"{left}/{right}"
 
 
 def load_app_config(config_path: Path) -> AppConfig:
@@ -71,8 +56,6 @@ def load_app_config(config_path: Path) -> AppConfig:
         raise ValueError("ftp.username 和 ftp.password 不能为空")
 
     port = int(ftp_raw.get("port", 21))
-    base_path = _normalize_list_path(str(ftp_raw.get("base_path", "")))
-
     key = str(data.get("key", "")).strip()
     if not key:
         raise ValueError("key 不能为空")
@@ -96,7 +79,6 @@ def load_app_config(config_path: Path) -> AppConfig:
             port=port,
             username=username,
             password=password,
-            base_path=base_path,
         ),
         key=key,
         paths=paths,
@@ -287,8 +269,7 @@ def run_check(config_path: Path, timeout_override: int | None) -> int:
 
         success = 0
         for raw_path in target_paths:
-            remote_path = safe_join_remote_path(cfg.base_path, raw_path)
-            if run_check_one(ftp, remote_path, key):
+            if run_check_one(ftp, raw_path, key):
                 success += 1
 
         failed = len(target_paths) - success

@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -18,10 +19,51 @@ from tkinter.scrolledtext import ScrolledText
 from check_ftp import run_check
 
 
+def _enable_high_dpi_mode() -> None:
+    """Enable DPI awareness on Windows to avoid blurry Tk rendering."""
+    if sys.platform != "win32":
+        return
+
+    try:
+        import ctypes
+
+        # Best option on modern Windows: Per-Monitor V2 DPI awareness.
+        per_monitor_v2 = ctypes.c_void_p(-4)
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(per_monitor_v2):
+            return
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 class CheckerGui:
+    STATUS_PATTERN = re.compile(r"^(.*?)\s*->\s*(已完成|未完成)\s*\(文件数:\s*(\d+)\)\s*$")
+    STATUS_COL_WIDTH = 90
+    COUNT_COL_WIDTH = 80
+    MIN_PATH_COL_WIDTH = 180
+    TREE_ROW_HEIGHT = 28
+    WINDOW_MARGIN = 80
+    MIN_WINDOW_W = 960
+    MIN_WINDOW_H = 640
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Homework Checker GUI")
+        self._configure_ui_style()
         self._set_window_geometry()
 
         # In frozen executable mode, use EXE directory as workspace.
@@ -31,12 +73,27 @@ class CheckerGui:
             self.workspace = Path(__file__).resolve().parent
         self.config_path = self.workspace / "checker_config.json"
 
-        self.result_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.result_queue: queue.Queue[str] = queue.Queue()
         self.is_running = False
 
         self._build_ui()
         self._load_config_into_form()
         self.root.after(100, self._poll_result_queue)
+
+    def _configure_ui_style(self) -> None:
+        style = ttk.Style(self.root)
+        style.configure("Treeview", rowheight=self.TREE_ROW_HEIGHT)
+        if sys.platform == "win32":
+            try:
+                style.theme_use("vista")
+            except tk.TclError:
+                pass
+
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+                try:
+                    tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=10)
+                except tk.TclError:
+                    pass
 
     def _set_window_geometry(self) -> None:
         # Keep a consistent 3:2 window ratio across different screen sizes.
@@ -53,12 +110,12 @@ class CheckerGui:
             height = max_h
             width = int(height * aspect_ratio)
 
-        min_w = 960
-        min_h = 640
-        width = min(width, screen_w - 80)
-        height = min(height, screen_h - 80)
-        width = max(width, min(min_w, screen_w - 80))
-        height = max(height, min(min_h, screen_h - 80))
+        max_width = screen_w - self.WINDOW_MARGIN
+        max_height = screen_h - self.WINDOW_MARGIN
+        width = min(width, max_width)
+        height = min(height, max_height)
+        width = max(width, min(self.MIN_WINDOW_W, max_width))
+        height = max(height, min(self.MIN_WINDOW_H, max_height))
 
         pos_x = (screen_w - width) // 2
         pos_y = (screen_h - height) // 2
@@ -67,13 +124,14 @@ class CheckerGui:
         self.root.maxsize(width, height)
 
     def _build_ui(self) -> None:
-        container = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        container = ttk.Frame(self.root)
         container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         left = ttk.Frame(container, padding=10)
         right = ttk.Frame(container, padding=10)
-        container.add(left, weight=2)
-        container.add(right, weight=3)
+        # Fixed left:right = 1:2, and non-draggable by design.
+        left.place(relx=0.0, rely=0.0, relwidth=1 / 3, relheight=1.0)
+        right.place(relx=1 / 3, rely=0.0, relwidth=2 / 3, relheight=1.0)
 
         # Left panel: config editor
         row = 0
@@ -82,43 +140,15 @@ class CheckerGui:
         ttk.Entry(left, textvariable=self.config_path_var, width=46).grid(row=row, column=1, sticky="ew", padx=6)
         ttk.Button(left, text="选择", command=self._choose_config_file).grid(row=row, column=2)
 
-        row += 1
-        ttk.Label(left, text="Host").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.host_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.host_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
+        self.host_var, row = self._add_labeled_entry(left, row, "主机")
+        self.port_var, row = self._add_labeled_entry(left, row, "端口")
+        self.username_var, row = self._add_labeled_entry(left, row, "用户名")
+        self.password_var, row = self._add_labeled_entry(left, row, "密码", show="*")
+        self.key_var, row = self._add_labeled_entry(left, row, "关键字")
+        self.timeout_var, row = self._add_labeled_entry(left, row, "超时")
 
         row += 1
-        ttk.Label(left, text="Port").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.port_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.port_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-
-        row += 1
-        ttk.Label(left, text="Username").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.username_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.username_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-
-        row += 1
-        ttk.Label(left, text="Password").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.password_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.password_var, show="*").grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-
-        row += 1
-        ttk.Label(left, text="Base Path").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.base_path_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.base_path_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-
-        row += 1
-        ttk.Label(left, text="Key").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.key_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.key_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-
-        row += 1
-        ttk.Label(left, text="Timeout").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.timeout_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.timeout_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-
-        row += 1
-        ttk.Label(left, text="Paths (每行一个)").grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ttk.Label(left, text="路径列表（每行一个）").grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
         row += 1
         self.paths_text = ScrolledText(left, height=14, wrap=tk.WORD)
@@ -135,11 +165,74 @@ class CheckerGui:
         left.columnconfigure(1, weight=1)
         left.rowconfigure(row - 1, weight=1)
 
-        # Right panel: output
-        ttk.Label(right, text="检查结果").pack(anchor="w")
-        self.result_text = ScrolledText(right, wrap=tk.WORD)
-        self.result_text.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-        self.result_text.configure(state=tk.DISABLED)
+        # Right panel: graphical result list + log
+        ttk.Label(right, text="检查结果（列表）").pack(anchor="w")
+
+        tree_frame = ttk.Frame(right)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 8))
+
+        columns = ("status", "path", "count")
+        self.result_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=14)
+        self.result_tree.heading("status", text="状态")
+        self.result_tree.heading("path", text="目录")
+        self.result_tree.heading("count", text="文件数")
+        self.result_tree.column("status", width=self.STATUS_COL_WIDTH, anchor="center", stretch=False)
+        self.result_tree.column("path", width=self.MIN_PATH_COL_WIDTH, anchor="w", stretch=False)
+        self.result_tree.column("count", width=self.COUNT_COL_WIDTH, anchor="center", stretch=False)
+        self.result_tree.bind("<Button-1>", self._block_tree_column_resize)
+        self.result_tree.bind("<B1-Motion>", self._block_tree_column_resize)
+
+        self.result_tree.tag_configure("done", background="#eaf7ea")
+        self.result_tree.tag_configure("todo", background="#fbeaea")
+
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
+        self.result_tree.configure(yscrollcommand=tree_scroll.set)
+
+        self.result_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.root.after(0, self._fit_tree_columns)
+
+        ttk.Label(right, text="运行日志").pack(anchor="w")
+        self.log_text = ScrolledText(right, wrap=tk.WORD, height=9)
+        self.log_text.pack(fill=tk.BOTH, expand=False, pady=(6, 0))
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _add_labeled_entry(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        show: str | None = None,
+    ) -> tuple[tk.StringVar, int]:
+        row += 1
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(8, 0))
+        value = tk.StringVar()
+        ttk.Entry(parent, textvariable=value, show=show).grid(
+            row=row,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            padx=6,
+            pady=(8, 0),
+        )
+        return value, row
+
+    def _block_tree_column_resize(self, event: tk.Event) -> str | None:
+        if self.result_tree.identify_region(event.x, event.y) == "separator":
+            return "break"
+        return None
+
+    def _fit_tree_columns(self) -> None:
+        tree_width = self.result_tree.winfo_width()
+        if tree_width <= 1:
+            self.root.after(30, self._fit_tree_columns)
+            return
+
+        path_width = tree_width - self.STATUS_COL_WIDTH - self.COUNT_COL_WIDTH - 4
+        path_width = max(path_width, self.MIN_PATH_COL_WIDTH)
+        self.result_tree.column("path", width=path_width)
 
     def _choose_config_file(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -165,7 +258,6 @@ class CheckerGui:
         self.port_var.set(str(ftp.get("port", 21)))
         self.username_var.set(str(ftp.get("username", "")))
         self.password_var.set(str(ftp.get("password", "")))
-        self.base_path_var.set(str(ftp.get("base_path", "")))
         self.key_var.set(str(data.get("key", "")))
         self.timeout_var.set(str(data.get("timeout", 15)))
 
@@ -186,7 +278,6 @@ class CheckerGui:
                 "port": int(self.port_var.get().strip()),
                 "username": self.username_var.get().strip(),
                 "password": self.password_var.get().strip(),
-                "base_path": self.base_path_var.get().strip(),
             },
             "key": self.key_var.get().strip(),
             "paths": paths,
@@ -215,6 +306,7 @@ class CheckerGui:
 
         config_path = Path(self.config_path_var.get().strip() or self.config_path)
         self._append_result("开始执行检查...\n")
+        self._clear_result_list()
         self.is_running = True
         self.run_button.configure(state=tk.DISABLED)
 
@@ -229,31 +321,65 @@ class CheckerGui:
                 exit_code = run_check(config_path, timeout_override=None)
 
             output = output_buf.getvalue() + err_buf.getvalue()
-            self.result_queue.put(("done", output + f"\n[exit_code={exit_code}]\n"))
+            self.result_queue.put(output + f"\n[exit_code={exit_code}]\n")
         except Exception as exc:
-            self.result_queue.put(("done", f"执行失败: {exc}\n"))
+            self.result_queue.put(f"执行失败: {exc}\n")
 
     def _poll_result_queue(self) -> None:
         try:
             while True:
-                kind, payload = self.result_queue.get_nowait()
-                if kind == "done":
-                    self._append_result(payload)
-                    self.is_running = False
-                    self.run_button.configure(state=tk.NORMAL)
+                payload = self.result_queue.get_nowait()
+                self._render_result_list(payload)
+                self._append_result(payload)
+                self.is_running = False
+                self.run_button.configure(state=tk.NORMAL)
         except queue.Empty:
             pass
         finally:
             self.root.after(100, self._poll_result_queue)
 
     def _append_result(self, text: str) -> None:
-        self.result_text.configure(state=tk.NORMAL)
-        self.result_text.insert(tk.END, text)
-        self.result_text.see(tk.END)
-        self.result_text.configure(state=tk.DISABLED)
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, text)
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _clear_result_list(self) -> None:
+        self.result_tree.delete(*self.result_tree.get_children())
+
+    def _extract_status_rows(self, output: str) -> list[tuple[str, str, int]]:
+        rows: list[tuple[str, str, int]] = []
+        for line in output.splitlines():
+            match = self.STATUS_PATTERN.match(line.strip())
+            if not match:
+                continue
+            folder_path = match.group(1)
+            status = match.group(2)
+            file_count = int(match.group(3))
+            rows.append((folder_path, status, file_count))
+        return rows
+
+    def _render_result_list(self, output: str) -> None:
+        rows = self._extract_status_rows(output)
+        self._clear_result_list()
+        if not rows:
+            return
+
+        # Put unfinished rows before completed rows, then sort by path.
+        rows.sort(key=lambda row: (row[1] == "已完成", row[0]))
+
+        for folder_path, status, file_count in rows:
+            tag = "done" if status == "已完成" else "todo"
+            self.result_tree.insert(
+                "",
+                tk.END,
+                values=(status, folder_path, file_count),
+                tags=(tag,),
+            )
 
 
 def main() -> None:
+    _enable_high_dpi_mode()
     root = tk.Tk()
     CheckerGui(root)
     root.mainloop()
