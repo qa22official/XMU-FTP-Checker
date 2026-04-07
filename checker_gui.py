@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import ftplib
 import queue
 import re
 import sys
@@ -16,7 +17,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from check_ftp import run_check
+from check_ftp import load_app_config, run_check
 
 
 def _enable_high_dpi_mode() -> None:
@@ -52,6 +53,7 @@ def _enable_high_dpi_mode() -> None:
 
 class CheckerGui:
     STATUS_PATTERN = re.compile(r"^(.*?)\s*->\s*(已完成|未完成)\s*\(文件数:\s*(\d+)\)\s*$")
+    IGNORED_STATUS = "已忽略"
     STATUS_COL_WIDTH = 90
     COUNT_COL_WIDTH = 80
     MIN_PATH_COL_WIDTH = 180
@@ -59,6 +61,8 @@ class CheckerGui:
     WINDOW_MARGIN = 80
     MIN_WINDOW_W = 960
     MIN_WINDOW_H = 640
+    UI_STATE_KEY = "ui_state"
+    UI_RESULT_ROWS_KEY = "result_rows"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -75,6 +79,7 @@ class CheckerGui:
 
         self.result_queue: queue.Queue[str] = queue.Queue()
         self.is_running = False
+        self.ignored_original_status_by_path: dict[str, str] = {}
 
         self._build_ui()
         self._load_config_into_form()
@@ -159,7 +164,7 @@ class CheckerGui:
         actions.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         ttk.Button(actions, text="重新加载", command=self._load_config_into_form).pack(side=tk.LEFT)
         ttk.Button(actions, text="保存配置", command=self._save_form_to_config).pack(side=tk.LEFT, padx=8)
-        self.run_button = ttk.Button(actions, text="保存并检查", command=self._save_and_run)
+        self.run_button = ttk.Button(actions, text="更新结果", command=self._save_and_run)
         self.run_button.pack(side=tk.LEFT)
 
         left.columnconfigure(1, weight=1)
@@ -181,9 +186,16 @@ class CheckerGui:
         self.result_tree.column("count", width=self.COUNT_COL_WIDTH, anchor="center", stretch=False)
         self.result_tree.bind("<Button-1>", self._block_tree_column_resize)
         self.result_tree.bind("<B1-Motion>", self._block_tree_column_resize)
+        self.result_tree.bind("<Button-3>", self._show_result_item_menu)
 
         self.result_tree.tag_configure("done", background="#eaf7ea")
         self.result_tree.tag_configure("todo", background="#fbeaea")
+        self.result_tree.tag_configure("ignored", background="#efefef", foreground="#666666")
+
+        self.result_item_menu = tk.Menu(self.root, tearoff=0)
+        self.result_item_menu.add_command(label="忽略", command=self._toggle_ignore_menu_target_item)
+        self.result_item_menu.add_command(label="选择文件并提交", command=self._choose_file_and_submit_for_item)
+        self._menu_target_iid: str | None = None
 
         tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
         self.result_tree.configure(yscrollcommand=tree_scroll.set)
@@ -234,6 +246,157 @@ class CheckerGui:
         path_width = max(path_width, self.MIN_PATH_COL_WIDTH)
         self.result_tree.column("path", width=path_width)
 
+    def _show_result_item_menu(self, event: tk.Event) -> str | None:
+        iid = self.result_tree.identify_row(event.y)
+        if not iid:
+            return None
+
+        values = self.result_tree.item(iid, "values")
+        current_status = str(values[0]) if values else ""
+        ignore_label = "取消忽略" if current_status == self.IGNORED_STATUS else "忽略"
+        self.result_item_menu.entryconfigure(0, label=ignore_label)
+
+        self.result_tree.selection_set(iid)
+        self.result_tree.focus(iid)
+        self._menu_target_iid = iid
+        try:
+            self.result_item_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.result_item_menu.grab_release()
+        return "break"
+
+    def _status_sort_rank(self, status: str) -> int:
+        if status == self.IGNORED_STATUS:
+            return 2
+        if status == "已完成":
+            return 1
+        return 0
+
+    def _status_to_tag(self, status: str) -> str:
+        if status == self.IGNORED_STATUS:
+            return "ignored"
+        if status == "已完成":
+            return "done"
+        return "todo"
+
+    def _resort_tree_items(self) -> None:
+        rows: list[tuple[str, str, str, int]] = []
+        for iid in self.result_tree.get_children():
+            status, folder_path, file_count = self.result_tree.item(iid, "values")
+            rows.append((iid, str(status), str(folder_path), int(file_count)))
+
+        rows.sort(key=lambda row: (self._status_sort_rank(row[1]), row[2]))
+        for index, (iid, _status, _folder_path, _file_count) in enumerate(rows):
+            self.result_tree.move(iid, "", index)
+
+    def _toggle_ignore_menu_target_item(self) -> None:
+        if not self._menu_target_iid:
+            return
+
+        values = list(self.result_tree.item(self._menu_target_iid, "values"))
+        if len(values) != 3:
+            return
+
+        current_status = str(values[0])
+        folder_path = str(values[1]).strip()
+
+        if current_status == self.IGNORED_STATUS:
+            restore_status = self.ignored_original_status_by_path.get(folder_path, "未完成")
+            values[0] = restore_status
+        else:
+            self.ignored_original_status_by_path[folder_path] = current_status
+            values[0] = self.IGNORED_STATUS
+
+        self.result_tree.item(
+            self._menu_target_iid,
+            values=tuple(values),
+            tags=(self._status_to_tag(str(values[0])),),
+        )
+        self._resort_tree_items()
+        self._save_result_state_to_config()
+
+    def _ask_submit_confirmation(self, file_name: str) -> bool:
+        result = {"confirmed": False}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("确认提交")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        ttk.Label(dialog, text=f"已选择文件：{file_name}").pack(padx=16, pady=(14, 6), anchor="w")
+        ttk.Label(dialog, text="是否提交该文件？").pack(padx=16, pady=(0, 12), anchor="w")
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        def on_cancel() -> None:
+            result["confirmed"] = False
+            dialog.destroy()
+
+        def on_confirm() -> None:
+            result["confirmed"] = True
+            dialog.destroy()
+
+        ttk.Button(buttons, text="取消", command=on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="确认", command=on_confirm).pack(side=tk.RIGHT, padx=(0, 8))
+
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.grab_set()
+        dialog.wait_window()
+        return bool(result["confirmed"])
+
+    def _choose_file_and_submit_for_item(self) -> None:
+        if not self._menu_target_iid:
+            return
+
+        row_values = self.result_tree.item(self._menu_target_iid, "values")
+        if len(row_values) != 3:
+            messagebox.showerror("提交失败", "无法识别当前条目的远程目录")
+            return
+        remote_path = str(row_values[1]).strip()
+        if not remote_path:
+            messagebox.showerror("提交失败", "当前条目缺少远程目录路径")
+            return
+
+        file_path = filedialog.askopenfilename(
+            title="选择要提交的文件",
+            initialdir=str(self.workspace),
+            filetypes=[("All Files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        local_file = Path(file_path)
+        file_name = local_file.name
+        if not self._ask_submit_confirmation(file_name):
+            return
+
+        try:
+            self._upload_file_to_remote_path(local_file, remote_path)
+            messagebox.showinfo("提交结果", f"提交成功：{file_name}\n目标目录：{remote_path}")
+            self._append_result(f"提交成功: {file_name} -> {remote_path}\n")
+        except Exception as exc:
+            messagebox.showerror("提交失败", f"上传失败: {exc}")
+            self._append_result(f"提交失败: {file_name} -> {remote_path} ({exc})\n")
+
+    def _upload_file_to_remote_path(self, local_file: Path, remote_path: str) -> None:
+        config_path = self._get_active_config_path()
+        app_cfg = load_app_config(config_path)
+        cfg = app_cfg.ftp
+
+        ftp = ftplib.FTP(encoding="gbk")
+        try:
+            ftp.connect(cfg.host, cfg.port, timeout=app_cfg.timeout)
+            ftp.login(cfg.username, cfg.password)
+            ftp.cwd(remote_path)
+
+            with local_file.open("rb") as fp:
+                ftp.storbinary(f"STOR {local_file.name}", fp)
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+
     def _choose_config_file(self) -> None:
         file_path = filedialog.askopenfilename(
             title="选择 JSON 配置文件",
@@ -245,10 +408,121 @@ class CheckerGui:
         self.config_path_var.set(file_path)
         self._load_config_into_form()
 
-    def _load_config_into_form(self) -> None:
-        path = Path(self.config_path_var.get().strip() or self.config_path)
+    def _get_active_config_path(self) -> Path:
+        return Path(self.config_path_var.get().strip() or self.config_path)
+
+    def _read_config_data(self, path: Path) -> dict:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("配置文件根节点必须是对象")
+        return data
+
+    def _write_config_data(self, path: Path, data: dict) -> None:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _collect_tree_rows(self) -> list[dict[str, str | int]]:
+        rows: list[dict[str, str | int]] = []
+        for iid in self.result_tree.get_children():
+            status, folder_path, file_count = self.result_tree.item(iid, "values")
+            rows.append(
+                {
+                    "path": str(folder_path),
+                    "status": str(status),
+                    "count": int(file_count),
+                }
+            )
+        return rows
+
+    def _apply_result_rows_to_tree(self, rows: list[tuple[str, str, int]]) -> None:
+        self._clear_result_list()
+        if not rows:
+            return
+
+        rows.sort(key=lambda row: (self._status_sort_rank(row[1]), row[0]))
+        for folder_path, status, file_count in rows:
+            self.result_tree.insert(
+                "",
+                tk.END,
+                values=(status, folder_path, file_count),
+                tags=(self._status_to_tag(status),),
+            )
+
+    def _get_ignored_paths_from_config_data(self, data: dict) -> set[str]:
+        state = data.get(self.UI_STATE_KEY)
+        if not isinstance(state, dict):
+            return set()
+
+        persisted_rows = state.get(self.UI_RESULT_ROWS_KEY)
+        if not isinstance(persisted_rows, list):
+            return set()
+
+        ignored_paths: set[str] = set()
+        for row in persisted_rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("status", "")) != self.IGNORED_STATUS:
+                continue
+            row_path = str(row.get("path", "")).strip()
+            if row_path:
+                ignored_paths.add(row_path)
+        return ignored_paths
+
+    def _save_result_state_to_config(self) -> None:
+        path = self._get_active_config_path()
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = self._read_config_data(path)
+        except Exception:
+            return
+
+        state = data.get(self.UI_STATE_KEY)
+        if not isinstance(state, dict):
+            state = {}
+            data[self.UI_STATE_KEY] = state
+        state[self.UI_RESULT_ROWS_KEY] = self._collect_tree_rows()
+
+        try:
+            self._write_config_data(path, data)
+        except Exception:
+            return
+
+    def _restore_result_state_from_config(self, data: dict) -> None:
+        state = data.get(self.UI_STATE_KEY)
+        if not isinstance(state, dict):
+            self._clear_result_list()
+            return
+
+        persisted_rows = state.get(self.UI_RESULT_ROWS_KEY)
+        if not isinstance(persisted_rows, list):
+            self._clear_result_list()
+            return
+
+        rows: list[tuple[str, str, int]] = []
+        for row in persisted_rows:
+            if not isinstance(row, dict):
+                continue
+
+            row_path = str(row.get("path", "")).strip()
+            status = str(row.get("status", "")).strip()
+            raw_count = row.get("count", 0)
+
+            if not row_path:
+                continue
+            if status not in ("已完成", "未完成", self.IGNORED_STATUS):
+                continue
+
+            try:
+                file_count = int(raw_count)
+            except (TypeError, ValueError):
+                file_count = 0
+
+            rows.append((row_path, status, file_count))
+
+        self._apply_result_rows_to_tree(rows)
+
+    def _load_config_into_form(self) -> None:
+        path = self._get_active_config_path()
+        try:
+            data = self._read_config_data(path)
         except Exception as exc:
             messagebox.showerror("读取失败", f"无法读取配置: {exc}")
             return
@@ -265,6 +539,8 @@ class CheckerGui:
         self.paths_text.delete("1.0", tk.END)
         if isinstance(paths, list):
             self.paths_text.insert("1.0", "\n".join(str(p) for p in paths))
+
+        self._restore_result_state_from_config(data)
 
         self._append_result(f"已加载配置: {path}\n")
 
@@ -285,10 +561,11 @@ class CheckerGui:
         }
 
     def _save_form_to_config(self) -> bool:
-        path = Path(self.config_path_var.get().strip() or self.config_path)
+        path = self._get_active_config_path()
         try:
             data = self._build_config_from_form()
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            data[self.UI_STATE_KEY] = {self.UI_RESULT_ROWS_KEY: self._collect_tree_rows()}
+            self._write_config_data(path, data)
             self._append_result(f"配置已保存: {path}\n")
             return True
         except ValueError:
@@ -361,21 +638,29 @@ class CheckerGui:
 
     def _render_result_list(self, output: str) -> None:
         rows = self._extract_status_rows(output)
-        self._clear_result_list()
+        self.ignored_original_status_by_path = {folder_path: status for folder_path, status, _ in rows}
+        try:
+            config_data = self._read_config_data(self._get_active_config_path())
+            ignored_paths = self._get_ignored_paths_from_config_data(config_data)
+        except Exception:
+            ignored_paths = set()
+
+        if ignored_paths:
+            rows = [
+                (
+                    folder_path,
+                    self.IGNORED_STATUS if folder_path in ignored_paths else status,
+                    file_count,
+                )
+                for folder_path, status, file_count in rows
+            ]
+
+        self._apply_result_rows_to_tree(rows)
         if not rows:
+            self._save_result_state_to_config()
             return
 
-        # Put unfinished rows before completed rows, then sort by path.
-        rows.sort(key=lambda row: (row[1] == "已完成", row[0]))
-
-        for folder_path, status, file_count in rows:
-            tag = "done" if status == "已完成" else "todo"
-            self.result_tree.insert(
-                "",
-                tk.END,
-                values=(status, folder_path, file_count),
-                tags=(tag,),
-            )
+        self._save_result_state_to_config()
 
 
 def main() -> None:

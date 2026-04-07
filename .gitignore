@@ -3,3 +3,5 @@ build/
 output.txt
 *.zip
 checker_config.json
+__pycache__
+.gitignore
